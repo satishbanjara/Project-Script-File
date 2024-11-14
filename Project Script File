@@ -1,0 +1,162 @@
+# Setup Options
+opt <- list()
+opt$wd <- "~/inb321g/project"
+opt$rString <- gsub(" ", "_", gsub(" \\(.*", "", R.version.string))
+opt$yourPckDir <- file.path("./Rpackages", opt$rString)
+opt$sharedPckDir <- "/stor/scratch/inb321g/project/GDCdata/TCGA-COAD/Transcriptome_Profiling/Gene_Expression_Quantification"
+opt$gdcPath <- "/stor/scratch/inb321g/project/GDCdata/TCGA-COAD/Transcriptome_Profiling/Gene_Expression_Quantification"
+opt$project <- "TCGA-THCA"  # Set to the thyroid cancer project
+opt$sample.type <- "Primary Tumor"
+opt$group1Desc <- "Stage 1 Thyroid Cancer"
+opt$group2Desc <- "Stage 2 Thyroid Cancer"
+opt$grp1File <- "s1.txt"
+opt$grp2File <- "s2.txt"
+opt$fdr.max <- 0.01
+opt$afc.min <- 1.5
+
+
+# Directory Setup
+if (!dir.exists(opt$wd)) dir.create(opt$wd, recursive = TRUE, showWarnings = TRUE)
+setwd(opt$wd)
+if (!dir.exists(opt$yourPckDir)) dir.create(opt$yourPckDir, recursive = TRUE, showWarnings = TRUE)
+.libPaths(opt$yourPckDir)
+
+# Package Installation
+opt$cranPackages <- c("BiocManager", "ggplot2", "ggrepel", "htmlwidgets", "plotly", "heatmaply")
+opt$biocPackages <- c("DESeq2", "Biostrings", "SummarizedExperiment", "GenomeInfoDbData", "ComplexHeatmap", "TCGAbiolinks")
+if (!all(opt$biocPackages %in% installed.packages())) {
+  if (!"BiocManager" %in% installed.packages()) install.packages("BiocManager", lib = opt$yourPckDir)
+  BiocManager::install(opt$biocPackages, lib = opt$yourPckDir, ask = FALSE, update = TRUE)
+}
+
+# Load Data
+group1 <- read.delim(opt$grp1File, fill = TRUE, header = TRUE)
+group2 <- read.delim(opt$grp2File, fill = TRUE, header = TRUE)
+
+# Set up project for TCGA query
+opt$project <- unique(c(group1$Project.ID, group2$Project.ID))
+
+# Libraries
+library(ggplot2)
+library(ggrepel)
+library(DESeq2)
+library(TCGAbiolinks)
+library(readxl)
+
+# Initial TCGA Query
+query1 <- GDCquery(
+  project = opt$project,
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  access = "open"
+)
+
+samDf <- query1$results[[1]]
+samDf$inGrp1 <- samDf$sample.submitter_id %in% group1$Sample.ID
+samDf$inGrp2 <- samDf$sample.submitter_id %in% group2$Sample.ID
+samDf$sampleLogic <- samDf$inGrp1 | samDf$inGrp2
+opt$initBarcodes <- samDf$cases[samDf$sampleLogic]
+
+query2 <- GDCquery(
+  project = opt$project,
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  access = "open",
+  barcode = opt$initBarcodes
+)
+
+
+# Data Download and Preparation
+GDCdownload(query = query2, method = "api", files.per.chunk = 10, directory = "~/inb321g/project/GDCdata")
+
+# DESeq2 Object Setup
+dds1 <- GDCprepare(query = query2, directory = "~/inb321g/project/GDCdata")
+dds1$group1 <- dds1$sample_submitter_id %in% group1$Sample.ID
+dds1$group2 <- dds1$sample_submitter_id %in% group2$Sample.ID
+colData(dds1)$comp <- factor(x = colData(dds1)$group2, levels = c(FALSE, TRUE))
+dds <- DESeqDataSet(dds1, design = ~ comp)
+
+# Differential Expression Analysis
+dds <- DESeq(dds)
+res <- results(dds)
+
+# Filter and Prepare Results for Volcano Plot
+resOutput <- as.data.frame(res)
+resOutput <- resOutput[!is.na(resOutput$log2FoldChange) & !is.na(resOutput$padj), ]
+resOutput$Significant <- with(resOutput, padj < opt$fdr.max & abs(log2FoldChange) > opt$afc.min)
+
+# Volcano Plot
+volcano_plot <- ggplot(resOutput, aes(x = log2FoldChange, y = -log10(padj), color = Significant)) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c("purple", "darkgreen")) +
+  labs(title = "Volcano Plot: Stage 1 vs Stage 2 Thyroid Cancer",
+       x = "Log2 Fold Change", y = "-log10(FDR-adjusted p-value)") +
+  theme_minimal() +
+  geom_hline(yintercept = -log10(opt$fdr.max), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-opt$afc.min, opt$afc.min), linetype = "dashed", color = "red") +
+  geom_text_repel(data = subset(resOutput, Significant), aes(label = rownames(subset(resOutput, Significant))), 
+                  size = 3, max.overlaps = 10)
+
+# Display Plot
+print(volcano_plot)
+
+# PCA Plot
+#dds <- estimateSizeFactors(dds)
+#normCounts <- counts(dds, normalized = TRUE)
+#pca_res <- prcomp(t(normCounts), scale. = TRUE)
+#pca_data <- as.data.frame(pca_res$x)
+#pca_data$Stage <- colData(dds)$comp
+
+# Basic PCA Plot
+#pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Stage)) +
+#  geom_point(size = 3, alpha = 0.8) +
+#  labs(title = "PCA of Gene Expression: Stage 1 vs Stage 2 Thyroid Cancer",
+ #      x = paste0("PC1: ", round(100 * summary(pca_res)$importance[2, 1], 1), "% variance"),
+  #     y = paste0("PC2: ", round(100 * summary(pca_res)$importance[2, 2], 1), "% variance")) +
+#  theme_minimal()
+
+# Display PCA Plot
+#print(pca_plot)
+
+
+# PCA Plot
+dds <- estimateSizeFactors(dds)
+normCounts <- counts(dds, normalized = TRUE)
+
+# Check for zero variance columns
+zero_var_cols <- apply(normCounts, 1, var) == 0
+if (any(zero_var_cols)) {
+  cat("Removing zero variance rows: ", sum(zero_var_cols), " rows removed.\n")
+  normCounts <- normCounts[!zero_var_cols, ]
+} else {
+  cat("No zero variance rows found.\n")
+}
+
+# Verify the dimensions and content of normCounts
+cat("Dimensions of normCounts after filtering: ", dim(normCounts), "\n")
+cat("Summary of normCounts:\n")
+print(summary(normCounts))
+
+# Perform PCA
+pca_res <- prcomp(t(normCounts), scale. = TRUE)
+pca_data <- as.data.frame(pca_res$x)
+pca_data$Stage <- colData(dds)$comp
+
+# Calculate percent variance explained for each PC
+percentVar <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+
+# Plot 1: Basic PCA plot with color differentiation by stage
+pca_plot1 <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Stage)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "PCA of Gene Expression: Stage 1 vs Stage 2 Thyroid Cancer",
+    x = paste0("PC1: ", round(100 * summary(pca_res)$importance[2, 1], 1), "% variance"),
+    y = paste0("PC2: ", round(100 * summary(pca_res)$importance[2, 2], 1), "% variance")
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Display Plot 1
+print(pca_plot1)
